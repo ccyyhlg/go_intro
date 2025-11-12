@@ -95,7 +95,7 @@ graph TD
     - **最终决策**: 本次查找，是去`oldbuckets`里找，还是去`buckets`里找？
 
 2.  **查找阶段 (两阶段查找)**: 在确定了目标表（新表或旧表）后，开始遍历桶和溢出链：
-    - **第一阶段：[tophash](cci:1://file:///usr/local/go/src/runtime/map_noswiss.go:193:0-200:1)快速筛选**: [tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)存储了`key`哈希值的高8位。在一个桶内，可以一次性，在8个[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)值中，进行快速比较，迅速排除掉绝大部分不匹配的槽位。
+    - **第一阶段：[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)快速筛选**: [tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)存储了`key`哈希值的高8位。在一个桶内，可以一次性，在8个[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)值中，进行快速比较，迅速排除掉绝大部分不匹配的槽位。
     - **第二阶段：完整`key`比较**: 只有在[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)匹配成功后，才会进行一次完整的、开销更大的`key`比较。
 
 #### 删除 ([mapdelete](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L736-L859))
@@ -119,10 +119,107 @@ graph TD
 - `emptyOne`这个“墓碑”，告诉后续的查找操作：“这里是空的，但请不要停，继续往后找”。
 - 这些大量的“墓碑”，正是“同尺寸扩容”需要被触发，来进行“大扫除”的原因之一。
 
+### 5. 并发、性能与设计哲学
+
+#### `map` 不是并发安全的
+
+首先，明确结论：Go原生的`map`**不是**并发安全的。
+
+- 它允许多个goroutine**并发地读**。
+- 但它**不允许**在有读操作的同时，进行写操作；更不允许**并发地写**。
+
+任何在没有外部同步机制（如`mutex`）保护的情况下，对同一个`map`进行并发读写或并发写的行为，都会导致不可预知的后果，最常见的就是程序直接`panic`。
+
+#### “唯一的努力”：`hashWriting` Flag
+- Go `map`为了处理并发问题，所做的**唯一**的、也是最轻量级的努力，就是在`hmap.flags`中，使用了一个比特位：`hashWriting`。
+
+### 附录：并发冲突可视化
+
+若没有`hashWriting` flag的保护，`map`的数据结构会在并发访问下，被轻易地破坏。下面两个场景，通过序列图，直观地展示了其灾难性的后果。
+
+#### 场景一：并发写 (Write-Write) 冲突
+
+**描述**: 两个Goroutine同时对一个正好需要扩容的`map`进行写操作。
+
+
+```mermaid
+sequenceDiagram
+    participant Goroutine A (写)
+    participant Goroutine B (写)
+    participant map (hmap)
+
+    Note over Goroutine A, map: 初始状态: map需要扩容, 搬迁进度 h.nevacuate = 5
+
+    Goroutine A->>map: mapassign("keyA")
+    Goroutine B->>map: mapassign("keyB")
+
+    map-->>Goroutine A: 发现需要扩容
+    Goroutine A->>map: 调用 hashGrow(), 设置 h.growing() = true
+
+    map-->>Goroutine B: 发现需要扩容
+    Goroutine B->>map: 调用 hashGrow(), 发现 h.growing() 已为 true, 跳过创建
+
+    Note over Goroutine A, Goroutine B: 两者都进入 growWork()
+    Goroutine A->>map: 准备搬迁 oldbucket #5
+    Goroutine B->>map: 也准备搬迁 oldbucket #5
+
+    rect rgb(255, 220, 220)
+        Note over Goroutine A, Goroutine B: **竞态条件 (RACE CONDITION)**<br/>两者都认为自己要搬迁同一个桶
+        Goroutine A->>map: evacuate(5): 搬迁桶 #5
+        Goroutine A->>map: 原子操作: h.nevacuate++ (变为 6)
+        Goroutine B->>map: evacuate(5): **再次搬迁桶 #5, 覆盖A的结果!**
+        Goroutine B->>map: 原子操作: h.nevacuate++ (变为 7)
+    end
+
+    Note over map: **数据已损坏!**<br/>- 数据被覆盖<br/>- 搬迁进度混乱 (桶 #6 被跳过)
+```
+
+**后果分析**:
+*   **数据损坏**: Goroutine B的操作，覆盖了Goroutine A的搬迁结果，导致数据丢失或重复。
+*   **状态错乱**: 搬迁进度计数器`h.nevacuate`被错误地增加了两次，导致中间的桶被整个跳过，永远不会被搬迁。
+*   **程序崩溃**: 如果其中一个Goroutine率先完成了整个扩容，并将`oldbuckets`置为`nil`，另一个仍在工作的Goroutine就会因访问`nil`指针而`panic`。
+
+---
+
+#### 场景二：并发读写 (Read-Write) 冲突
+
+**描述**: 在`map`扩容期间，一个Goroutine在读取一个正在被另一个Goroutine搬迁的桶。
+
+
+```mermaid
+sequenceDiagram
+    participant Goroutine B (读)
+    participant Goroutine A (写)
+    participant oldB (旧桶)
+
+    Note over Goroutine B, oldB: 初始状态: Goroutine B 准备读取旧桶 oldB
+
+    Goroutine B->>oldB: mapaccess: 检查到 oldB 未搬迁, 准备进入查找
+    
+    Note over Goroutine B, Goroutine A: **上下文切换 (Context Switch)**
+
+    Goroutine A->>oldB: evacuate(oldB): 开始搬迁 oldB 的内容
+    Goroutine A-->>oldB: 将 key1 搬到新桶, 并将 oldB.tophash[0] 更新为 "evacuatedX"
+    Goroutine A-->>oldB: 将 key2 搬到新桶, 并将 oldB.tophash[1] 更新为 "evacuatedY"
+    
+    Note over Goroutine B, Goroutine A: **上下文切换 (Context Switch)**
+
+    rect rgb(255, 220, 220)
+        Note over Goroutine B, oldB: **读取到不一致的数据**
+        Goroutine B->>oldB: 继续在 oldB 内查找, 此时它看到的是一个<br/>正在被修改的、"半成品"状态的桶
+    end
+    
+    Note over Goroutine B, oldB: **幻读 (Phantom Read) 发生!**<br/>- Goroutine B 要找的 key 可能已被搬走<br/>- 它在旧桶里找不到, 也不会再去新桶找<br/>- 最终错误地返回 "not found"
+```
+
+**后果分析**:
+*   **幻读 (Phantom Read)**: 这是最典型的后果。读操作，在一个“即将失效”的旧桶里，找不到它想要的`key`，并且，它也错过了去新桶查找的机会（因为这个决定，是在循环开始前就做出的）。最终，它得出了“`key`不存在”的错误结论，尽管这个`key`实际上，好好地，存在于`map`中。
+*   **读取到垃圾数据**: 在更极端的情况下，读操作，可能会读取到一个，已经被部分修改的`key`或`value`，导致程序逻辑错误。
+
 ---
 Go 的map介绍结束了---------吗？
 
-### 5. `map` 的未来：`swiss` map 简介
+### 6. `map` 的未来：`swiss` map 简介
 
 Go 1.2x版本后，实验性的`swiss` map，旨在解决缓存局部性差 (Poor Cache Locality) 指针追逐 (Pointer Chasing)。
 
