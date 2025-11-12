@@ -85,7 +85,7 @@ graph TD
 
 ### 4. `map` 的核心操作：写入 && 查找 && 删除
 
-#### 写入与更新 ([[mapassign](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L605-L734)](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L561-L734))
+#### 写入与更新 ([mapassign](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L605-L734))
 
 `map`的写入操作，是所有逻辑中最复杂的，因为它不仅要处理插入和更新，还肩负着触发扩容和渐进式搬迁的重任。其完整流程，是一个严谨的、分阶段的过程：
 
