@@ -80,9 +80,45 @@ graph TD
     2.  **顺序保底搬运**: 按照`h.nevacuate`计数器的顺序，额外再搬运一个旧桶。
 - **目的**: 这种“随机触发 + 顺序保底”的机制，确保了，即使在最坏的情况下，搬迁工作，也能稳步地、线性地，向前推进，并最终完成。
 
+#### 无收缩机制
 ---
 
-### 4. `map` 的核心操作：查找与删除
+### 4. `map` 的核心操作：写入 && 查找 && 删除
+
+#### 写入与更新 ([[mapassign](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L605-L734)](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L561-L734))
+
+`map`的写入操作，是所有逻辑中最复杂的，因为它不仅要处理插入和更新，还肩负着触发扩容和渐进式搬迁的重任。其完整流程，是一个严谨的、分阶段的过程：
+
+1.  **前置检查**:
+    *   检查`map`是否为`nil`，如果是，则`panic`。
+    *   检查`hashWriting` flag，防止并发写。
+
+2.  **哈希计算与定位**:
+    *   和[`mapaccess`](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L410-L474)一样，计算`key`的哈希值，并定位到主桶（`b`）。
+
+3.  **扩容决策**:
+    *   这是写入操作的第一个关键决策点。它会检查，是否需要，立即开始一次扩容：
+        *   [!h.growing()](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L1180-L1183): 确保当前没有正在进行的扩容。
+        *   [overLoadFactor()](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L1160-L1163)]: 负载因子是否超过6.5？
+        *   [tooManyOverflowBuckets()](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L1165-L1178): 溢出桶是否过多？
+    *   如果满足条件，则立即调用[hashGrow()](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L1117-L1158)开始扩容，并重新计算定位桶`b`。
+
+4.  **寻找目标槽位 (核心循环)**:
+    *   开始`bucketloop`，遍历主桶和其所有溢出桶。
+    *   在这个循环中，它会**同时做两件事**：
+        a.  **寻找已有Key (用于更新)**: 尝试寻找匹配的`key`。如果找到了，说明是**更新操作**。它会直接更新`value`，然后完成操作并返回。
+        b.  **寻找空槽位 (用于插入)**: 如果没找到匹配的`key`，它会继续寻找第一个可用的空槽位（[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)为`emptyRest`或`emptyOne`），并将其位置（桶`insertb`和槽位索引`inserti`）记录下来，备用。
+
+5.  **渐进式搬迁**:
+    *   如果在循环开始时，`map`正在扩容中（[h.growing()](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L1180-L1183)为`true`），那么，本次写操作，就必须“顺手”帮忙，调用[growWork()](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L1209-L1218)，完成一到两个桶的搬迁工作。
+
+6.  **执行插入**:
+    *   在遍历完所有桶，都没有找到匹配的`key`后，就进入了**插入新值**的阶段。
+    *   **情况一 (找到空槽)**: 如果在第4步中，已经找到了一个可用的空槽位，那么，就直接，在这个位置，插入新的`key`、`value`和[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)。
+    *   **情况二 (未找到空槽)**: 如果遍历完了整个桶链，发现它已经满了，那么：
+        a.  调用[newoverflow()](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L245-L271)，从预备队中，取出一个新的溢出桶。
+        b.  将这个新桶，链接到当前桶链的末尾。
+        c.  在新溢出桶的第一个槽位，插入新的`key`、`value`和[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)。
 
 #### 查找 (`mapaccess`)
 
@@ -104,6 +140,7 @@ graph TD
 
 1.  **查找**: 首先，像查找一样，定位到目标`key`所在的槽位。
 2.  **标记**: 找到后，将该槽位的[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)值，设置为`emptyOne` (值为1)。
+3.  **清理优化**: 后面的值是 emptyRest 情况下，从这个点开始将所有前置的 emptyOne 升级成 emptyRest，因为约定 emptyRest 后绝对是空的。
 
 ```mermaid
 graph TD
