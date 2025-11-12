@@ -42,10 +42,10 @@ graph TD
     end
 
     subgraph bmap [桶结构]
-        tophash[tophash[8]]
-        keys[keys[8]]
-        values[values[8]]
-        overflow[overflow 指针]
+        tophash["tophash[8]"]
+        keys["keys[8]"]
+        values["values[8]"]
+        overflow["overflow 指针"]
     end
 
     subgraph OverflowPool [溢出桶内存池]
@@ -124,7 +124,7 @@ Go 的map介绍结束了---------吗？
 
 ### 5. `map` 的未来：`swiss` map 简介
 
-Go 1.2x版本后，实验性的`swiss` map，旨在解决这些问题。
+Go 1.2x版本后，实验性的`swiss` map，旨在解决缓存局部性差 (Poor Cache Locality) 指针追逐 (Pointer Chasing)。
 
 - **核心思想**: 借鉴Google的Swiss Table，它是一种基于**开放寻址法**的变体，并结合了**SIMD（单指令多数据）**优化。
 - **关键优势**:
