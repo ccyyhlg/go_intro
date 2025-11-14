@@ -55,6 +55,23 @@ graph TD
 
     B1 -- overflow --> O1
 ```
+
+#### [tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)的设计思想：缓存友好的快速路径
+
+[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)的存在，是为了，在`map`的查找、插入和删除操作中，建立一条**缓存极其友好**的“快速失败”路径。
+
+*   **核心问题**: 一次常规的`map`查找，可能，需要，进行多次昂贵的“指针解引用”操作（从[hmap](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L113-L128)到[bmap](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L148-L158)，再到`key`和`value`所在的内存），并且，可能会，因为`key`的类型不同（比如`string`），而需要，进行相对耗时的内存比较。
+
+*   **[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)的解决方案**:
+    1.  **紧凑存储**: [tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)数组，与[bmap](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L148-L158)的其他字段，一起，存放在一块连续的内存中。当[bmap](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L148-L158)被加载到CPU缓存时，[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)数组，也极大概率，会被一同加载。
+    2.  **快速预检**: 当进行查找时，`runtime`，会先，用目标`key`的[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)值，去和[bmap](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L148-L158)的[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)数组中的8个值，进行比较。
+        *   这是一个极其快速的、整型数字的比较，完全，在CPU缓存中进行，没有任何指针解引用。
+        *   如果，在这8个[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)中，**没有一个**，能匹配上，那么，`runtime`，就可以**100%确定**，这个`key`，绝对，不在当前的[bmap](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L148-L158)中，从而，可以，立即，跳过后续所有昂贵的指针解引用和`key`比较操作，直接，去检查下一个溢出桶。
+    3.  **指针规避**: [tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)的设计，本质上，是一种“用计算换访存”的思想。它，通过，增加一点点存储（8个字节）和一次快速的计算（[tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)比较），来**规避**掉大量潜在的、缓慢的、对主内存的访问（指针解引用和`key`比较）。
+
+*   **总结**: [tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)，是`map`性能优化的点睛之笔。它，通过，在内存布局上，实现“缓存局部性”，并在算法流程上，增加“快速预检”路径，极大地，提升了`map`在查找未命中时的性能。
+
+
 ### 3. 动态的艺术：扩容规则
 
 随着元素不断增加，`map`需要扩容，来保证查找效率。`noswiss` map主要有两种扩容触发条件：
@@ -80,7 +97,8 @@ graph TD
     2.  **顺序保底搬运**: 按照`h.nevacuate`计数器的顺序，额外再搬运一个旧桶。
 - **目的**: 这种“随机触发 + 顺序保底”的机制，确保了，即使在最坏的情况下，搬迁工作，也能稳步地、线性地，向前推进，并最终完成。
 
-#### 无收缩机制
+### 无收缩机制
+
 ---
 
 ### 4. `map` 的核心操作：写入 && 查找 && 删除
