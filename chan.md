@@ -83,8 +83,6 @@ graph TD
 
 ### 3. [`makechan`](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/chan.go#L75-L125)：一个Channel的诞生
 
-当我们在代码中写下 `make(chan int, 10)` 时，`runtime`会调用`makechan`函数，来创建一个`hchan`实例。
-
 当我们在代码中写下 `make(chan *int, 10)` 时，`runtime`会调用`makechan`函数。这个函数内部，有一个基于`channel`特性，进行内存分配策略选择的关键决策点：
 
 ```go
