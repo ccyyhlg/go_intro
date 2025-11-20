@@ -181,18 +181,28 @@ graph TD
 
 ## 第四部分：完善设计：删除与晋升 (Completing the Design)
 
-### 4.1 积木五：为无锁删除而生的 `expunged` 哨兵
+### 4.1 积木五：两种“逻辑删除”状态 - `nil` 与 `expunged`
 
-为了避免在 `read` map 上加锁删除，`sync.Map` 采用了“逻辑删除”的策略。它引入了一个特殊的哨兵指针 `expunged`。
+为了避免在 `read` map 上加锁删除，`sync.Map` 采用了“逻辑删除”的策略。它精妙地使用了两种不同的状态来表示“已删除”，以服务于不同的 API 和性能目标。
 
-当 `Delete(key)` 被调用时：
-1.  它找到 `read` map 中的 `entry`。
-2.  它原子地将 `entry` 的内部指针 `p` 交换为 `expunged`。
+1.  **`p -> nil` (空指针)**:
+    *   **执行者**: `Delete` 和 `LoadAndDelete` 的快速路径。
+    *   **含义**: “这个 key 刚刚被高效地删除了，entry 是干净的，可以被后续的 `Store` 立刻复用。”
+    *   **优势**: 这是最高效的删除方式，允许 key 在不进入慢路径的情况下被“复活”。
 
-`Load` 操作在读取 `entry` 时，如果发现指针 `p` 是 `expunged`，就认为该 key 不存在，返回 `(nil, false)`。
-同时约定： dirty 复制所有 read 的 entry 时可以忽略掉已经被删除的key
+2.  **`p -> expunged` (哨兵指针) - 最终的“死亡证明”**:
+    *   **诞生的真相 (The Truth)**: `expunged` 的诞生，与 `Load` 的未命中毫无关系。它只发生在**写操作的慢路径**中，并且是在一个极其特殊的时刻：
+        1.  一个写操作（如 `Store` 一个新 key）在 `read` map 中未命中，进入了加锁的慢路径。
+        2.  它发现 `dirty` map 尚未被创建 (`m.dirty == nil`)。
+        3.  **系统决定创建 `dirty` map**。它会遍历当前的 `read` map，准备将其中的内容复制到新的 `dirty` map 中。
+        4.  在遍历 `read` map 的过程中，当它遇到了一个 `p` 为 `nil` 的 `entry` 时（这是一个之前被 `Delete` 操作留下的“空壳”），它知道这个 `entry` 无需被复制到新的 `dirty` map 中。
+        5.  **就在此刻，它调用 `tryExpungeLocked`**，尝试用一次 `CAS`，将 `read` map 中这个 `entry` 的指针，从 `nil` **翻转为 `expunged`**。
+        6.  这个 `entry` 不会被复制到新的 `dirty` map 中。
+    *   **含义**: `expunged` 是一个**最终的、不可逆的“死亡证明”**。它宣告：“这个 `entry` 所代表的 key，不仅已被删除，而且在 `read` map -> `dirty` map 的这次状态同步中，它已被正式‘清除’，无需再理会。”
+    *   **作用**: 它是一种“惰性清理”机制，确保了 `dirty` map 在创建时，是干净的、不包含已删除 key 的，同时，在 `read` map 中，留下了一个明确的、永久性的“墓碑”标记。
 
-**优势**：删除操作也变成了无锁的原子操作（一次更新），不会阻塞并发的 `Load`。
+`Load` 操作在读取 `entry` 时，如果发现指针 `p` 是 `nil` 或 `expunged`，都会认为该 key 不存在，返回 `(nil, false)`。
+同时约定：`dirty` map 在从 `read` map 复制数据时，会忽略掉所有 `p` 为 `nil` 或 `expunged` 的 `entry`。
 
 ```mermaid
 stateDiagram-v2
@@ -300,13 +310,18 @@ sequenceDiagram
 
 ### 5.3 [`Delete(key any)`](https://github.com/golang/go/blob/release-branch.go1.24/src/sync/map.go#L324)
 
-`Delete` 的目标是**无锁地标记删除**。
+`Delete` 的目标是**最高效地、无锁地标记删除**。
 
-1.  **主要逻辑**: `Delete` 的核心逻辑与 `LoadOrStore` 类似，但它写入的是 `expunged` 哨兵值。
-    *   在 `read` map 中找到 `entry`，尝试用 `CAS` 将 `p` 交换为 `expunged`。这会处理绝大多数情况。
-    *   如果 `read` map 中没有，或 `entry` 已经被 `expunged`，则进入慢路径，加锁查找 `dirty` map 并直接从中删除 `key`。
+1.  **快速路径**: 
+    *   `Delete` 的核心是调用 `LoadAndDelete`。
+    *   在 `read` map 中找到 `key` 对应的 `entry`。
+    *   调用 `entry.delete()`，其核心是 `e.p.CompareAndSwap(p, nil)`，原子地将指针交换为 `nil`。
+    *   这会处理绝大多数情况，实现了极高的删除性能，并允许 `entry` 被快速复用。
 
-**一致性承诺**: `Delete` 保证当它返回时，该 `key` 要么被标记为 `expunged`，要么已从 `dirty` map 中移除。并发的 `Load` 可能会因为 `expunged` 而返回 `false`。
+2.  **慢速路径**: 
+    *   如果 `read` map 中没有找到 `key`，则进入慢路径，加锁查找 `dirty` map 并直接从中删除 `key`。
+
+**一致性承诺**: `Delete` 保证当它返回时，该 `key` 的 `entry` 指针要么被置为 `nil`，要么已从 `dirty` map 中移除。并发的 `Load` 会因为 `p` 是 `nil` 而返回 `false`。
 
 ### 5.4 [`LoadOrStore(key, value any) (actual any, loaded bool)`](https://github.com/golang/go/blob/release-branch.go1.24/src/sync/map.go#L231)
 
