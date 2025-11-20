@@ -32,6 +32,8 @@ func (m *NaiveRWMap) Read(key string) string {
 
 **核心矛盾**: 这种实现，读操作和写操作会相互阻塞，读操作之间也会相互阻塞。在一个“读多写少”的场景下，这会造成巨大的性能瓶颈。我们的核心诉求是：**允许多个读操作并发执行**。
 
+值得注意的是，虽然 `RWMutex` 是解决 `Mutex` 在“读多写少”场景下性能瓶颈的正确方向，但它自身也存在性能边界。`RWMutex` 的所有操作，都围绕一个中心化的状态变量 (`readerCount`) 进行，在高并发下，对这个变量的原子操作，会引发激烈的 CPU 缓存一致性争抢。因此，在“超高并发读”的场景下，`RWMutex` 的性能，会远逊于像 `sync.Map` 这样、基于“无锁读取”思想的、更高级的并发数据结构。我们推导 `RWMutex`，是为了理解“有锁并发”的精髓，但必须认识到，它并非并发性能优化的终点。
+
 ### 积木二：引入并发读，以及新的矛盾
 
 为了实现并发读，我们不能再让 `Read` 操作去获取那个全局的互斥锁。但如果不加锁，`Read` 和 `Write` 之间就会发生数据竞争。
@@ -101,31 +103,63 @@ type RWMutex struct {
     writerSem   uint32       // 写者信号量
     readerSem   uint32       // 读者信号量
     readerCount int32        // 读者计数 & 写者状态
-    readerWait  int32        // 等待的写者唤醒后，需要等待的读者数
+    readerWait  int32        // 写者获取写锁后需要等待的正在读的读者数量 (读者债务)
 }
 ```
 
+这两张图，分别描述了 `RWMutex` 中两个最核心的动态交互过程。
+
+**图一：写者获取锁 & 读者偿还债务**
+
 ```mermaid
-graph TD
-    subgraph RWMutex
-        direction LR
-        W[w: Mutex] -- "写-写互斥" --> RC[readerCount]
-        RC -- "状态判断" --> WS[writerSem]
-        RC -- "状态判断" --> RS[readerSem]
+sequenceDiagram
+    participant W as Writer (Lock)
+    participant R as Reader (RUnlock)
+    participant RW as RWMutex
+
+    W->>RW: 1. Lock() - 获取内部锁 w
+    W->>RW: 2. readerCount -= maxReaders (进入写模式)
+    W->>RW: 3. 得到 r (操作前的读者数)
+    alt r > 0
+        W->>RW: 4. readerWait += r (记录债务)
+        W->>RW: 5. 在 writerSem 上睡眠
     end
 
-    subgraph Goroutines
-        Reader[Reader Goroutine] -- "RLock" --> RC
-        Writer[Writer Goroutine] -- "Lock" --> W
+    loop 对每个正在读的 Reader
+        R-->>RW: 6. RUnlock()
+        R-->>RW: 7. readerWait-- (偿还债务)
     end
 
-    Reader -- "readerCount < 0?" --> RS_Wait{Sleep on readerSem}
-    Writer -- "readerCount > 0?" --> WS_Wait{Sleep on writerSem}
+    Note right of R: 最后一个 Reader 将 readerWait 减为 0
+    R->>W: 8. 唤醒在 writerSem 上的 Writer
 
-    style W fill:#dae8fc,stroke:#6c8ebf
-    style RC fill:#d5e8d4,stroke:#82b366
-    style WS fill:#ffe6cc,stroke:#d79b00
-    style RS fill:#ffe6cc,stroke:#d79b00
+    W->>W: 9. 获取写锁成功
+```
+
+**图二：写者释放锁 & 读者被唤醒**
+
+```mermaid
+sequenceDiagram
+    participant W as Writer (Unlock)
+    participant R as Reader (RLock)
+    participant RW as RWMutex
+
+    Note over W, R: 前提：一个 Writer 持有写锁，多个 Reader 在等待
+
+    loop 每个想读的 Reader
+        R->>RW: 1. RLock() - readerCount++
+        Note right of R: 发现 readerCount < 0 (写模式)
+        R->>RW: 2. 在 readerSem 上睡眠
+    end
+
+    W->>RW: 3. Unlock()
+    W->>RW: 4. readerCount += maxReaders (退出写模式)
+    Note left of W: 得到 r (在写锁期间等待的读者数)
+    W->>R: 5. 广播式唤醒所有 r 个在 readerSem 上的 Reader
+
+    loop 每个被唤醒的 Reader
+        R->>R: 6. 获取读锁成功
+    end
 ```
 
 ### 2.2 API 实现推演
