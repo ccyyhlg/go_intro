@@ -126,11 +126,11 @@ l := p.local                              // 指令 B
 ```mermaid
 graph TD
     subgraph "pool.Get() 主路径"
-        A[Start Get()] --> B{"private not empty"};
+        A["Start Get()"] --> B{"private not empty"};
         B -- Yes --> C[1. 返回 private];
         B -- No --> D{"local shared not empty"};
         D -- Yes --> E[2. 返回 local shared head];
-        D -- No --> F[调用 getSlow(pid)];
+        D -- No --> F["调用 getSlow(pid)"];
     end
 
     subgraph "getSlow() 慢路径"
@@ -145,7 +145,7 @@ graph TD
 
     subgraph "pool.Get() 收尾"
         M --> N{"p New not nil"};
-        N -- Yes --> O[6. 返回 p.New()];
+        N -- Yes --> O["6. 返回 p.New()"];
         N -- No --> P[返回 nil];
 
         C --> Z[End];
