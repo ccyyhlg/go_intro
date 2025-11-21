@@ -126,25 +126,25 @@ l := p.local                              // 指令 B
 ```mermaid
 graph TD
     subgraph "pool.Get() 主路径"
-        A[Start Get()] --> B{l.private != nil?};
+        A[Start Get()] --> B{"l.private != nil?"};
         B -- Yes --> C[1. 返回 private];
-        B -- No --> D{l.shared.popHead()?};
+        B -- No --> D{"l.shared.popHead()?"};
         D -- Yes --> E[2. 返回 local shared head];
         D -- No --> F[调用 getSlow(pid)];
     end
 
     subgraph "getSlow() 慢路径"
-        F --> G{for other P: other.shared.popTail()?};
+        F --> G{"for other P: other.shared.popTail()?"};
         G -- Yes --> H[3. 返回 stolen object];
-        G -- No --> I{l.victim.private != nil?};
+        G -- No --> I{"l.victim.private != nil?"};
         I -- Yes --> J[4. 返回 local victim private];
-        I -- No --> K{for all P: victim.shared.popTail()?};
+        I -- No --> K{"for all P: victim.shared.popTail()?"};
         K -- Yes --> L[5. 返回 stolen victim object];
         K -- No --> M[返回 nil];
     end
 
     subgraph "pool.Get() 收尾"
-        M --> N{p.New != nil?};
+        M --> N{"p.New != nil?"};
         N -- Yes --> O[6. 返回 p.New()];
         N -- No --> P[返回 nil];
     end
@@ -180,7 +180,7 @@ graph TD
 
 ```mermaid
 graph TD
-    subgraph poolChain (火车)
+    subgraph "poolChain (火车)"
         direction LR
         HEAD["c.head"] --> D1(车厢 D1<br/>poolDequeue);
         D1 -- next --> D2(车厢 D2<br/>poolDequeue);
@@ -190,9 +190,9 @@ graph TD
         TAIL["c.tail"] --> D3;
     end
 
-    subgraph D3 (车厢 D3 内部)
+    subgraph "D3 (车厢 D3 内部)"
         direction TB
-        subgraph vals (座位)
+        subgraph "vals (座位)"
             S1[座1: obj_A];
             S2[座2: obj_B];
             S3[座3: ...];
