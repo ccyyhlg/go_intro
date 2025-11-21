@@ -211,10 +211,9 @@ sequenceDiagram
 
 4.  **`expunged` 作为最终解**: 为了解决这个危机，`expunged` 必须被发明出来。它是一个“**状态分裂的统一代号**”。
     *   **规则**: 在创建 `dirty` map 的复制过程中，当我们决定**不**将一个 `p` 为 `nil` 的 `entry` 复制过去时，我们**必须**通过 `tryExpungeLocked`，将 `read` map 中这个 `entry` 的指针，从 `nil` **原子地翻转为 `expunged`**。
-    *   **含义**: `expunged` 是一个“墓碑”，它在向全系统宣告：“我所代表的 `key`，现在只存在于 `read` map 中，`dirty` map 已经不认识我了。所有想操作我的请求，都必须进入慢路径，去 `dirty` map 中重建我们之间的一致性。” 在当前的设计阶段，这个“墓碑”将永久地留在 `read` map 中，成为一个待解决的内存与性能问题。
+    *   **含义**: `expunged` 是一个“墓碑”，它在向全系统宣告：“我所代表的 `key`，现在只存在于 `read` map 中，`dirty` map 已经不认识我了。所有想操作我的请求，都必须进入慢路径，去 `dirty` map 中重建我们之间的一致性。” 
 
 `Load` 操作在读取 `entry` 时，如果发现指针 `p` 是 `nil` 或 `expunged`，都会认为该 key 不存在，返回 `(nil, false)`。
-同时约定：`dirty` map 在从 `read` map 复制数据时，会忽略掉所有 `p` 为 `nil` 的 `entry`。
 
 ```mermaid
 stateDiagram-v2
