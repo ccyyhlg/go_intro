@@ -126,25 +126,25 @@ l := p.local                              // 指令 B
 ```mermaid
 graph TD
     subgraph "pool.Get() 主路径"
-        A[Start Get()] --> B{"private 非空?"};
+        A[Start Get()] --> B{private not empty};
         B -- Yes --> C[1. 返回 private];
-        B -- No --> D{"local shared 非空?"};
+        B -- No --> D{local shared not empty};
         D -- Yes --> E[2. 返回 local shared head];
         D -- No --> F[调用 getSlow(pid)];
     end
 
     subgraph "getSlow() 慢路径"
-        F --> G{"从 other P 窃取成功?"};
+        F --> G{steal from other P success};
         G -- Yes --> H[3. 返回 stolen object];
-        G -- No --> I{"local victim private 非空?"};
+        G -- No --> I{local victim private not empty};
         I -- Yes --> J[4. 返回 local victim private];
-        I -- No --> K{"从 victim 窃取成功?"};
+        I -- No --> K{steal from victim success};
         K -- Yes --> L[5. 返回 stolen victim object];
         K -- No --> M[返回 nil];
     end
 
     subgraph "pool.Get() 收尾"
-        M --> N{"p.New 非空?"};
+        M --> N{p New not nil};
         N -- Yes --> O[6. 返回 p.New()];
         N -- No --> P[返回 nil];
     end
