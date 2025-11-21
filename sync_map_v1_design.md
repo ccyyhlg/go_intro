@@ -96,19 +96,10 @@ func (e *entry) load() any {
 *   **`Load`**: 优先从 `read` map 无锁读取。如果 `read` map 中没有，则加锁去 `dirty` map 中查找。
 *   **`Store`**: 对于新 key，加锁后写入 `dirty` map。
 
-#### 设计抉择：为何使用 `Mutex` 而非 `RWMutex`？
-
-这是一个非常深刻的问题。从表面上看，`dirty` map 会被 `Load` 的慢路径读取，被 `Store` 写入，似乎 `RWMutex` 是一个更优的选择。然而，Go 团队选择了 `Mutex`，这是一个经过深思熟虑的工程决策：
-
-1.  **收益场景极其有限**: `RWMutex` 唯一的收益，是允许多个 `Load` 操作同时进入慢路径并并发读取 `dirty` map。但 `sync.Map` 的核心设计就是让慢路径成为**低概率**事件。为了一个极罕见的场景，去引入一个更复杂的锁，收益很小。
-
-2.  **任何 `Store` 都会阻塞所有读者**: `Store` 操作必须获取**写锁**，这会阻塞所有试图进入慢路径的 `Load` 操作。由于慢路径是 `Store` 的必经之路，`RWMutex` 在此场景下会频繁地退化成一把普通的互斥锁。
-
-3.  **`Mutex` 开销更低**: `RWMutex` 的内部实现比 `Mutex` 复杂得多，其加解锁的固定开销更高。对于慢路径这个**低频、但临界区又需要绝对互斥**的场景，选择一个更简单、开销更低的 `Mutex` 是最优解。
-
-**结论**: `sync.Map` 的这把锁，保护的是一个**“复合事务”**（包括 `dirty` map 的创建、晋升等），而非简单的读写。在这种情况下，`Mutex` 以最低的成本，提供了最强的正确性保证。
-
-**个人观点**： 上面都是AI的扯皮。我的想法是这个地方是个低频区，设计时可能想法是 10000:1 的读写比例，那么对于写的操作确实可能有提升，但提升一般，而且读写锁也大了点。
+### 3.2 `dirty` map 数据定义
+1. **基本**：新增的 key 不可能永远存在慢速操作的 `dirty` 中，必然有一个时间点“晋升”，所以他必须包含全部 `read` 数据
+2. **同步**: `dirty` 数据要与 `read` 同步操作
+3. **优化**: 为了优化内存消耗 `dirty` 做到一定能力的**缩容**，即使他与第二点冲突。
 
 ```go
 // 概念代码
@@ -165,81 +156,17 @@ graph TD
     style m_dirty fill:#ffe6cc,stroke:#d79b00
 ```
 
-**新问题**：`read` 和 `dirty` 是两个独立的 `map`。如果一个 key 同时存在于两者中，会造成数据不一致。并且，为 `dirty` map 创建全新的 `entry` 会带来额外的内存分配开销。
+### 3.3 积木四：“晋升”机制
 
-### 3.2 积木四：为内存效率而生的 `entry` 复用
+**需求**：`dirty` map 中的 key 必须有办法进入快速路径。
 
-为了解决上述问题，我们规定：
-
-> 当 `dirty` map 被创建时，它会包含 `read` map 中所有 key。对于同一个 key，`read` map 和 `dirty` map 共享**同一个 `*entry` 实例**。
-
-这意味着，当 `Store` 更新一个已存在 key 的值时，它通过 `dirty` map 修改了那个共享 `entry` 的内部指针 `p`。由于 `read` map 也指向这个 `entry`，所以无锁的 `Load` 操作能立刻看到这个更新。这是一种极为精妙的设计，在保证数据一致性的同时，实现了极高的内存效率。
-
-**新问题**：如何处理删除？如果 `Delete` 操作直接从 `read` map 中删除了 `entry`，就需要加锁，违背了“无锁读”的初衷。如果不删除，内存会泄漏。
-
----
-
-## 第四部分：完善设计：删除与晋升 (Completing the Design)
-
-### 4.1 积木五：`expunged` 的第一性原理 - 为“状态一致性”而生
-
-`sync.Map` 的设计中，最精妙、也最深刻的部分，莫过于 `expunged` 哨兵的由来。它不是一个简单的删除标记，而是为了解决一个由“内存优化”所引发的、更深层次的“状态不一致”危机而诞生的。
-
-**逻辑推演的链条**: 
-
-1.  **起点 (`p -> nil`)**: `Delete` 操作，为了追求极致性能，只是将被删除 `entry` 的指针 `p` 置为 `nil`。这个 `entry` 依然存在于 `read` map 中，像一个“幽灵”。
-
-2.  **内存优化的需求**: 当系统决定创建 `dirty` map 时（在写操作的慢路径中），它需要从 `read` map 复制数据。为了避免 `dirty` map 继承 `read` map 中大量的“幽灵 `entry`”而造成内存膨胀，我们规定：**复制过程中，所有 `p` 为 `nil` 的 `entry` 都将被忽略。**
-
-3.  **状态不一致的危机**: 这个内存优化，立刻引发了一个致命的危机。现在，`read` map 中有一个 `p` 为 `nil` 的 `entry`，而 `dirty` map 中则完全没有这个 `key`。如果一个并发的 `Store` 操作，在快速路径上通过 `CAS` “复活”了这个 `nil` 的 `entry`，那么这个 `key` 将只存在于 `read` map 中，`dirty` map 对此一无所知。`read` 和 `dirty` 的状态发生了**灾难性的分裂**。
-
-4.  **`expunged` 作为最终解**: 为了解决这个危机，`expunged` 必须被发明出来。它是一个“**状态分裂的统一代号**”。
-    *   **规则**: 在创建 `dirty` map 的复制过程中，当我们决定**不**将一个 `p` 为 `nil` 的 `entry` 复制过去时，我们**必须**通过 `tryExpungeLocked`，将 `read` map 中这个 `entry` 的指针，从 `nil` **原子地翻转为 `expunged`**。
-    *   **含义**: `expunged` 是一个“墓碑”，它在向全系统宣告：“我所代表的 `key`，现在只存在于 `read` map 中，`dirty` map 已经不认识我了。所有想操作我的请求，都必须进入慢路径，去 `dirty` map 中重建我们之间的一致性。” 在当前的设计阶段，这个“墓碑”将永久地留在 `read` map 中，成为一个待解决的内存与性能问题。
-
-`Load` 操作在读取 `entry` 时，如果发现指针 `p` 是 `nil` 或 `expunged`，都会认为该 key 不存在，返回 `(nil, false)`。
-同时约定：`dirty` map 在从 `read` map 复制数据时，会忽略掉所有 `p` 为 `nil` 或 `expunged` 的 `entry`。
-
-```mermaid
-stateDiagram-v2
-    [*] --> Normal: Initial Store
-
-    Normal: p -> value
-    Expunged: p -> expunged
-    Nil: p -> nil
-
-    Normal --> Normal: Store (CAS)
-    Normal --> Expunged: Delete (CAS)
-    Expunged --> Nil: LoadOrStore (unexpungeLocked)
-    Nil --> Normal: LoadOrStore (swapLocked)
-
-    Expunged --> Expunged: Load (returns false)
-    Nil --> Nil: Load (returns false)
-```
-
-**新问题**：
-
-至此，我们的设计中悬而未决的核心性能问题：
-
-1.  **新 Key 访问性能低下 (来自积木三)**: 所有新创建的 key（尤其是可能成为热点的 key）都只存在于 `dirty` map 中。每一次对它们的 `Load` 操作都无法在 `read` map 中命中，从而被迫进入加锁的慢速路径，导致性能急剧下降。
-
-2.  **`expunged` (来自积木五)**: 放在了 `read` map 中
-
-### 4.2 积木六：为摊销成本而生的“晋升”机制
-
-为了解决上述问题，`sync.Map` 设计了“晋升”机制。
-
+**构建**：
 1.  **Miss 计数**: `sync.Map` 内部有一个 `misses` 计数器。每当 `Load` 操作在 `read` map 中未命中，必须加锁访问 `dirty` map 时，这个计数器就会增加。
 2.  **晋升触发**: 当 `misses` 的数量达到 `dirty` map 的长度时，就触发晋升。
-3.  **晋升过程**: 
+3.  **晋升过程**:
     a. 将当前的 `dirty` map 直接设置为新的 `read` map。
     b. 将 `dirty` map 设置为 `nil`。
     c. `misses` 计数器清零。
-
-**优势**：
-*   **摊销成本**: 将多次写操作的成本，通过一次“晋升”操作，均摊到多次“未命中”的 `Load` 操作上。
-*   **垃圾回收**: 晋升过程自然地清理了所有 `expunged` 的 `entry`，因为 `dirty` map 在创建时就不会包含它们。
-*   **性能恢复**: 晋升后，所有新 key 都进入了 `read` map，`Load` 操作的性能恢复到最高水平。
 
 ```mermaid
 sequenceDiagram
@@ -258,6 +185,52 @@ sequenceDiagram
     Note over SyncMap: Old read map is now unreferenced
     SyncMap-->>GC: Old read map becomes garbage
     User->>SyncMap: Load(new_key) // Now hits on read map
+```
+
+### 3.4 积木五：`entry` 复用
+
+**需求**：必须同时解决“一致性”和“效率”这两个问题。
+
+**构建**：我们规定，当 `dirty` map 被创建时（在第一次写入新 key 的慢路径中），它会包含 `read` map 中的**所有** key，这种复制本身是对 `read` 的读操作，不会造成读的性能问题。并且，对于同一个 key，`read` map 和 `dirty` map 将共享**同一个 `*entry` 实例**。
+
+---
+
+## 第四部分：完善设计：删除
+
+### 4.1 积木六：`expunged` 的第一性原理 - 为“状态一致性”而生
+
+`sync.Map` 如何做到既要状态一致，又要让他有一定的**缩容**能力，缩容一定得从 `Delete` 入手，无意义的数据没必要进入 `dirty`。
+
+**逻辑推演的链条**: 
+
+1.  **起点 (`p -> nil`)**: `Delete` 操作，如果在 `read` 操作，只能将被删除 `entry` 的指针 `p` 置为 `nil`。这个 `entry` 依然存在于 `read` map 中，像一个“幽灵”。
+
+2.  **内存优化的需求**: 当系统决定创建 `dirty` map 时（在写操作的慢路径中），它需要从 `read` map 复制数据。为了避免 `dirty` map 继承 `read` map 中大量的“幽灵 `entry`”而造成内存膨胀，我们规定：**复制过程中，所有 `p` 为 `nil` 的 `entry` 都将被忽略。**
+
+3.  **状态不一致的危机**: 这个内存优化，立刻引发了一个致命的危机。现在，`read` map 中有一个 `p` 为 `nil` 的 `entry`，而 `dirty` map 中则完全没有这个 `key`。如果一个并发的 `Store` 操作，在快速路径上通过 `CAS` “复活”了这个 `nil` 的 `entry`，那么这个 `key` 将只存在于 `read` map 中，`dirty` map 对此一无所知。`read` 和 `dirty` 的状态发生了**灾难性的分裂**。
+
+4.  **`expunged` 作为最终解**: 为了解决这个危机，`expunged` 必须被发明出来。它是一个“**状态分裂的统一代号**”。
+    *   **规则**: 在创建 `dirty` map 的复制过程中，当我们决定**不**将一个 `p` 为 `nil` 的 `entry` 复制过去时，我们**必须**通过 `tryExpungeLocked`，将 `read` map 中这个 `entry` 的指针，从 `nil` **原子地翻转为 `expunged`**。
+    *   **含义**: `expunged` 是一个“墓碑”，它在向全系统宣告：“我所代表的 `key`，现在只存在于 `read` map 中，`dirty` map 已经不认识我了。所有想操作我的请求，都必须进入慢路径，去 `dirty` map 中重建我们之间的一致性。” 在当前的设计阶段，这个“墓碑”将永久地留在 `read` map 中，成为一个待解决的内存与性能问题。
+
+`Load` 操作在读取 `entry` 时，如果发现指针 `p` 是 `nil` 或 `expunged`，都会认为该 key 不存在，返回 `(nil, false)`。
+同时约定：`dirty` map 在从 `read` map 复制数据时，会忽略掉所有 `p` 为 `nil` 的 `entry`。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Normal: Initial Store
+
+    Normal: p -> value
+    Expunged: p -> expunged
+    Nil: p -> nil
+
+    Normal --> Normal: Store (CAS)
+    Normal --> Expunged: Delete (CAS)
+    Expunged --> Nil: LoadOrStore (unexpungeLocked)
+    Nil --> Normal: LoadOrStore (swapLocked)
+
+    Expunged --> Expunged: Load (returns false)
+    Nil --> Nil: Load (returns false)
 ```
 
 ---
@@ -332,3 +305,17 @@ sequenceDiagram
     *   **过程**: 这是所有逻辑最复杂的地方。加锁后，它会仔细地检查 `read` map 和 `dirty` map 的状态，处理 `expunged` (通过 `unexpungeLocked` 复用 `entry`)，并最终保证“要么加载一个已存在的值，要么存储一个新值”这个操作的原子性。
 
 **一致性承诺**: `LoadOrStore` 提供了严格的原子性保证。它确保在并发环境下，一个 `key` 只会被创建一次，并且能可靠地加载或存储值，解决了 `Load` + `Store` 组合的竞态问题。
+
+#### 设计抉择：为何使用 `Mutex` 而非 `RWMutex`？
+
+从表面上看，`dirty` map 会被 `Load` 的慢路径读取，被 `Store` 写入，似乎 `RWMutex` 是一个更优的选择。然而，Go 团队选择了 `Mutex`，这是一个经过深思熟虑的工程决策：
+
+1.  **收益场景极其有限**: `RWMutex` 唯一的收益，是允许多个 `Load` 操作同时进入慢路径并并发读取 `dirty` map。但 `sync.Map` 的核心设计就是让慢路径成为**低概率**事件。为了一个极罕见的场景，去引入一个更复杂的锁，收益很小。
+
+2.  **任何 `Store` 都会阻塞所有读者**: `Store` 操作必须获取**写锁**，这会阻塞所有试图进入慢路径的 `Load` 操作。由于慢路径是 `Store` 的必经之路，`RWMutex` 在此场景下会频繁地退化成一把普通的互斥锁。
+
+3.  **`Mutex` 开销更低**: `RWMutex` 的内部实现比 `Mutex` 复杂得多，其加解锁的固定开销更高。对于慢路径这个**低频、但临界区又需要绝对互斥**的场景，选择一个更简单、开销更低的 `Mutex` 是最优解。
+
+**结论**: `sync.Map` 的这把锁，保护的是一个**“复合事务”**（包括 `dirty` map 的创建、晋升等），而非简单的读写。在这种情况下，`Mutex` 以最低的成本，提供了最强的正确性保证。
+
+**个人观点**： 上面都是AI的扯皮。我的想法是这个地方是个低频区，设计时可能想法是 10000:1 的读写比例，那么对于写的操作确实可能有提升，但提升一般，而且读写锁也大了点。
