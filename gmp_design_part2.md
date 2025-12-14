@@ -30,12 +30,51 @@
 
 对于 **纯计算任务 (CPU-Bound)**，整个城市就像一个精密的钟表。每个 M 都在重复着同一个动作，我称之为 **“摆渡循环”**。
 
+```mermaid
+sequenceDiagram
+    participant g0 as M (g0 栈)
+    participant User as M (用户 G 栈)
+
+    Note over g0: 1. schedule()
+    g0->>User: execute(g) -> gogo()
+    Note right of g0: 切换 SP 到用户栈
+    
+    activate User
+    Note over User: 2. 用户逻辑执行中
+    Note over User: 函数返回
+    User->>g0: 3. mcall(goexit0)
+    deactivate User
+    
+    Note left of g0: 栈重置 (回滚 SP)
+    Note over g0: 4. 清理与循环
+    g0->>g0: schedule()
+```
+
 ### 2.1 寻人 (Schedule)
 M (穿着 g0 装备) 站在路口四处张望：
 1.  **特权通道 (`sched.runnext`)**：先看刚才是不是有人插队，这里的 G 优先级最高。
 2.  **本地任务栏**：看看自己兜里 P 有没有活。
 3.  **中央大厅**：每隔 61 次，必须去中央大厅看一眼，防止那里的 G 饿死。
 4.  **偷猎 (Steal)**：如果自己空了，就去隔壁 P 家偷一半任务过来（劫富济贫）。
+
+```mermaid
+graph TD
+    subgraph P1 ["P1 (窃贼)"]
+        Q1[本地队列为空]
+    end
+    subgraph P2 ["P2 (受害者)"]
+        Q2[G1]
+        Q3[G2]
+        Q4[G3]
+        Q5[G4]
+    end
+    
+    M1["M1 运行 P1"] -- runqsteal --> P2
+    P2 -- "偷取一半 (G3, G4)" --> P1
+    
+    style P1 fill:#f9f,stroke:#333
+    style P2 fill:#ccf,stroke:#333
+```
 
 ### 2.2 载入 (Execute)
 M 找到了 G，脱下 `g0` 装备，换上“摆渡人”马甲：

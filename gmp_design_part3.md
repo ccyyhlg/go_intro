@@ -7,6 +7,20 @@
 当 G 需要读写文件或调用 CGO 时，M 必须亲自跳进内核的深坑。这意味着 M 会被操作系统暂停（Block），无法动弹。
 **危机**：如果 M 抱着 P 一起跳进坑里，P 里的其他 G 岂不是要饿死？
 
+```mermaid
+stateDiagram-v2
+    state "M1 运行中" as Running
+    state "M1 系统调用中 (持有 P1)" as Syscall
+    state "M1 阻塞 (P1 被偷)" as Blocked
+    state "P1 重分配给 M2" as Retaken
+
+    Running --> Syscall: entersyscall
+    Syscall --> Blocked: Sysmon 抢夺 (超时)
+    Syscall --> Running: exitsyscall (快路径)
+    Blocked --> Retaken: 移交 P1 -> M2
+    Blocked --> Running: exitsyscall (慢路径 - 找新 P)
+```
+
 ### 1.1 临别赠言 (entersyscall)
 M 在跳坑之前，会留一手：
 *   **动作**：M 修改 P 的状态为 `_Psyscall`。
@@ -33,6 +47,26 @@ M1 终于办完事从内核爬出来了。
 
 对于网络 IO（比如几十万个 TCP 连接），我们坚决不能让 M 阻塞。
 我们利用了操作系统的 **多路复用 (Epoll/Kqueue)** 技术，练就了“影分身”之术。
+
+```mermaid
+sequenceDiagram
+    participant G as 冒险者 (G)
+    participant M as 正规军 (M)
+    participant NP as 网络轮询器 (Epoll)
+    participant SM as 监察使/M
+    
+    G->>M: conn.Read() (数据未就绪)
+    M->>NP: 注册 fd 到 pollDesc
+    M->>G: gopark (切换至 _Gwaiting)
+    Note over M: M 获取下一个 G (非阻塞)
+    
+    Note over NP: ...网络数据到达...
+    
+    SM->>NP: netpoll()
+    NP-->>SM: 返回就绪列表 (G)
+    SM->>G: injectglist (切换至 _Grunnable)
+    Note over G: G 加入全局队列
+```
 
 ### 2.1 挂起 (Gopark)
 当 G 发起网络请求（`conn.Read`）发现数据没来时：
