@@ -255,7 +255,7 @@ stateDiagram-v2
     *   **触发条件**: 仅当在 `read` map 中**未找到** `key`，并且 `read` map 的 `amended` 标志为 `true` 时触发。
     *   **过程**: 加锁 `mu`，进行双重检查（因为 `read` map 可能在等待锁时已改变），然后查找 `dirty` map。
 
-**一致性承诺**: `Load` 提供的是弱一致性。它不保证能读到并发 `Store` 写入 `dirty` map 的最新值，甚至在 `Delete` -> `Store` 的并发竞争窗口中会短暂地返回 `false`。它的正确性依赖于“最终一致性”——在 `dirty` map 晋升后，所有值都将变得可读。
+**一致性承诺**: `Load` 提供的是**线性一致性 (Linearizability)** 甚至更强。哪怕数据刚被写入 `dirty` map（尚未晋升），`Load` 也会通过慢路径加锁读取到最新值。它绝不会返回一个“过期的”或“不存在的”错误结果（除非该 key 真的不存在）。它与标准 `map + Mutex` 的行为在正确性上是完全一致的，区别仅在于**性能特征**。
 
 ### 5.2 [`Store(key, value any)`](https://github.com/golang/go/blob/release-branch.go1.24/src/sync/map.go#L161)
 

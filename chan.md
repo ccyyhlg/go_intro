@@ -403,6 +403,54 @@ gopark(chanparkcommit, unsafe.Pointer(&c.lock), reason, traceBlockChanRecv, 2)
 
 ---
 
+### 7. `select`：多路复用的黑魔法
+
+`select` 语句是 Go 并发模型中皇冠上的明珠。它允许一个 Goroutine 同时等待多个 `channel` 的操作。它的实现（`runtime.selectgo`）极其复杂，因为它必须解决两个核心难题：**死锁预防**和**公平性**。
+
+#### 7.1 难题一：如何同时锁住多个 Channel？
+
+当 `select` 涉及多个 `channel` 时，为了安全地检查它们的状态，必须对它们**全部加锁**。
+如果 `G1` 执行 `select { case <-c1; case <-c2 }`，而 `G2` 执行 `select { case <-c2; case <-c1 }`。
+如果没有任何规则，G1 锁住 c1 等 c2，G2 锁住 c2 等 c1，就会发生**死锁**。
+
+**解决方案：全局锁排序 (Lock Order)**
+`runtime` 采用了一种简单而有效的策略：**按 `channel` 的内存地址排序加锁**。
+无论代码中写的顺序如何，`selectgo` 总是先锁地址小的 `hchan`，再锁地址大的。这就打破了环形等待条件，从数学上根除了死锁的可能性。
+
+#### 7.2 难题二：如何保证公平？
+
+如果有多个 `case` 都就绪了（例如都有数据可读），该选哪一个？
+如果总是按代码顺序（先检查 `case 1`，再检查 `case 2`），那么 `case 1` 就会拥有更高的优先级，导致后面的 `channel` 饥饿。
+
+**解决方案：随机轮询顺序 (Poll Order)**
+在每次执行 `select` 时，`runtime` 都会生成一个**随机的排列**（`pollorder`）。
+它按照这个随机顺序去检查各个 `case`。这意味着，即使所有 `channel` 都一直就绪，每一个 `case` 被选中的概率也是均等的。
+
+#### 7.3 `select` 的三步走战略
+
+`selectgo` 的执行流程可以概括为三个阶段：
+
+1.  **阶段一：洗牌与查锁 (Shuffle & Check)**
+    *   生成随机的 `pollorder`。
+    *   生成排序的 `lockorder`。
+    *   按照 `lockorder` **依次锁住所有涉及的 channel**。
+    *   按照 `pollorder` **依次检查**是否有 `case` 已经就绪（类似于非阻塞的 `chansend`/`chanrecv`）。
+    *   如果发现有一个就绪（比如 `buf` 有数据），直接执行该操作，**解锁所有 channel**，并返回。
+
+2.  **阶段二：全量入队 (Enqueue All)**
+    *   如果所有 `case` 都没就绪，且没有 `default` 分支，当前 G 就必须挂起。
+    *   G 会把自己包装成 `sudog`，**放入所有涉及 channel 的等待队列 (`sendq` 或 `recvq`) 中**。
+    *   注意：同一个 G，同时出现在了多个 `channel` 的队列里！
+    *   **解锁所有 channel**，调用 `gopark` 让 G 进入休眠。
+
+3.  **阶段三：被唤醒与清理 (Wakeup & Dequeue)**
+    *   当某个 `channel` 有动静了（比如有数据来了），它会唤醒这个 G。
+    *   **关键点**：G 醒来后，它需要再次**锁住所有 channel**。
+    *   为什么？因为它需要把自己从**其他**那些没被选中的 `channel` 的队列中**移除**（Dequeue）。我既然已经被 `c1` 唤醒了，`c2` 和 `c3` 就不应该再等着我了。
+    *   清理完毕后，解锁返回。
+
+---
+
 ### 附录：Channel与垃圾回收 (GC)
 
 -   **条件**: 当一个`channel`变量，在代码层面，变得**不可达**时（例如，函数返回，导致其局部作用域结束），无论它，是否被`close`过，也无论，其缓冲区中，是否有数据。

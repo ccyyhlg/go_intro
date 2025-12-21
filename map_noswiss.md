@@ -43,8 +43,8 @@ graph TD
 
     subgraph bmap [桶结构]
         tophash["tophash[8]"]
-        keys["keys[8]"]
-        values["values[8]"]
+        keys["keys[8] (key1, key2...)"]
+        values["values[8] (val1, val2...)"]
         overflow["overflow 指针"]
     end
 
@@ -55,6 +55,42 @@ graph TD
 
     B1 -- overflow --> O1
 ```
+
+#### 内存布局的深思：为什么是 `K K... V V...`？
+
+如果你去查看源码，会发现 `bmap` 的内存布局并非直观的 `Key-Value, Key-Value` 交替，而是：
+
+`tophash [8]uint8` | `keys [8]KeyType` | `values [8]ValueType` | `overflow *bmap`
+
+**为什么要这样设计？** 核心原因是**内存对齐 (Memory Alignment)**。
+
+假设 `map[int64]int8`：
+- `int64` 需要 8 字节对齐。
+- `int8` 需要 1 字节对齐。
+
+**如果是 KV 交替 (`int64, int8, int64, int8...`)**：
+每个 `int8` 后面都必须浪费 7 个字节的 Padding，以保证下一个 `int64` 的 8 字节对齐。一个桶就要浪费 `7 * 8 = 56` 字节。
+
+**如果是 KV 分离 (`int64...` | `int8...`)**：
+8 个 `int64` 紧凑排列，后面紧跟 8 个 `int8`。由于 `int8` 对齐要求低，这里**不需要任何 Padding**。
+
+这种布局极大地节省了堆内存，是典型的“**为了物理硬件而妥协代码逻辑**”的高级设计。
+
+#### 深度细节：Struct 和 String 到底存的是什么？
+
+你可能会问：如果 Key 是一个很大的 Struct，或者是一个 String，Bucket 里这“8 个 K”存的到底是数据本身，还是指针？
+
+Go Runtime 对此有一个硬性的**大小阈值（128 字节）**：
+
+1.  **直接存储 (Direct)**:
+    *   如果 Key 的大小 **<= 128 字节**，Bucket 里存的就是 **Value 本身**。
+    *   **Struct**: 例如 `type P struct {X, Y int}`，Bucket 里就实打实地存了 8 个 `P` 结构体的数据。查找时直接在 Bucket 内存里比较，**缓存极其友好**。
+    *   **String**: `string` 底层是 `struct { Data *byte; Len int }`，固定 16 字节。所以 Bucket 里存的是 **StringHeader**。查找时先比 Header，再解引用 Data 指针比对内容。
+
+2.  **间接存储 (Indirect)**:
+    *   如果 Key 的大小 **> 128 字节**（例如 `[1024]byte`），Bucket 存不下这么大的东西。
+    *   此时，Go 会偷偷将其退化为**指针**。Bucket 里存的是 8 个指向堆上实际数据的**指针**。
+    *   这避免了 Bucket 变得过大导致内存碎片，但也牺牲了一定的访问性能（多了一次指针跳转）。
 
 #### [tophash](https://github.com/golang/go/blob/release-branch.go1.24/src/runtime/map_noswiss.go#L193-L200)的设计思想：缓存友好的快速路径
 
@@ -81,7 +117,7 @@ graph TD
     - **行为**: 触发一次**2倍扩容**。桶的数量，会翻倍（`B++`）。这是一个常规的、为了增加容量的扩容。
 
 2.  **溢出桶 (Overflow Buckets) 过多**
-    - **你问的“什么叫过多”**: 当`map`中的溢出桶数量，约等于主桶数量时，就会被判定为“过多”。
+    - **“什么叫过多”**: 当`map`中的溢出桶数量，约等于主桶数量时，就会被判定为“过多”。
     - **精确条件**:
         - 当`B < 16`时，`noverflow`精确计数，条件是 `noverflow >= (1 << B)`。
         - 当`B >= 16`时，`noverflow`概率性计数，当计数值也达到阈值时触发。
