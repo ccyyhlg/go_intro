@@ -428,26 +428,71 @@ gopark(chanparkcommit, unsafe.Pointer(&c.lock), reason, traceBlockChanRecv, 2)
 
 #### 7.3 `select` 的三步走战略
 
-`selectgo` 的执行流程可以概括为三个阶段：
+`selectgo` 的执行流程可以概括为三个阶段（Pass 1, 2, 3）。
 
-1.  **阶段一：洗牌与查锁 (Shuffle & Check)**
+```mermaid
+graph TD
+    Start([selectgo 开始]) --> Init[生成 pollorder 随机 <br> 生成 lockorder 地址序]
+    Init --> LockAll[按 lockorder 锁住所有 Channel]
+    LockAll --> Pass1
+
+    subgraph "Pass 1: 检查 (Check)"
+        direction TB
+        Pass1[按 pollorder 遍历 Case] --> Check{Case 就绪?}
+        Check -- Yes --> Exec[执行操作] --> UnlockReturn([解锁并返回])
+        Check -- No --> NextCase[下一个 Case]
+        NextCase --> Pass1
+        Pass1 -- 全部未就绪 --> CheckDefault{有 Default?}
+        CheckDefault -- Yes --> UnlockReturn
+    end
+    
+    CheckDefault -- No --> Pass2
+
+    subgraph "Pass 2: 入队 (Enqueue)"
+        direction TB
+        Pass2[按 lockorder 遍历] --> Enqueue[将当前 G 包装成 sudog <br> 挂入所有 Channel 的等待队列]
+        Enqueue --> UnlockSleep[解锁所有 Channel <br> 调用 gopark 休眠]
+    end
+
+    UnlockSleep -- "被某个 Channel 唤醒<br>(竞态: 谁先 CAS 成功谁赢)" --> LockAllAgain[重新锁住所有 Channel]
+
+    subgraph "Pass 3: 清理 (Dequeue)"
+        direction TB
+        LockAllAgain --> Identify[确认赢家 Case]
+        Identify --> DequeueOthers[从其他 Channel 队列中 <br> 移除当前 G 的 sudog]
+        DequeueOthers --> UnlockAllAgain([解锁所有 Channel 并返回])
+    end
+```
+
+1.  **阶段一：洗牌与查锁 (Pass 1 - Check)**
     *   生成随机的 `pollorder`。
     *   生成排序的 `lockorder`。
     *   按照 `lockorder` **依次锁住所有涉及的 channel**。
     *   按照 `pollorder` **依次检查**是否有 `case` 已经就绪（类似于非阻塞的 `chansend`/`chanrecv`）。
     *   如果发现有一个就绪（比如 `buf` 有数据），直接执行该操作，**解锁所有 channel**，并返回。
 
-2.  **阶段二：全量入队 (Enqueue All)**
+2.  **阶段二：全量入队 (Pass 2 - Enqueue)**
     *   如果所有 `case` 都没就绪，且没有 `default` 分支，当前 G 就必须挂起。
     *   G 会把自己包装成 `sudog`，**放入所有涉及 channel 的等待队列 (`sendq` 或 `recvq`) 中**。
     *   注意：同一个 G，同时出现在了多个 `channel` 的队列里！
     *   **解锁所有 channel**，调用 `gopark` 让 G 进入休眠。
+    *   *注：这里的解锁是在 `gopark` 的回调（g0栈）中进行的，保证了“改状态为 waiting”和“解锁”的原子性，防止错失唤醒。*
 
-3.  **阶段三：被唤醒与清理 (Wakeup & Dequeue)**
+3.  **阶段三：被唤醒与清理 (Pass 3 - Dequeue)**
     *   当某个 `channel` 有动静了（比如有数据来了），它会唤醒这个 G。
     *   **关键点**：G 醒来后，它需要再次**锁住所有 channel**。
     *   为什么？因为它需要把自己从**其他**那些没被选中的 `channel` 的队列中**移除**（Dequeue）。我既然已经被 `c1` 唤醒了，`c2` 和 `c3` 就不应该再等着我了。
     *   清理完毕后，解锁返回。
+
+#### 7.4 “Select 随机性”的真相
+
+“当 select 有多个满足时会随机选择一个”。这句话**只对了一半**。
+
+- **Pass 1 (非阻塞检查)**：的确是**随机**的。
+  Runtime 通过洗牌算法打乱 `pollorder`，保证了如果多个 channel 同时有数据，它们被选中的概率是均等的。这是**算法保证的公平**（上帝掷骰子）。
+
+- **Pass 3 (阻塞后被唤醒)**：是**先到先得**的竞态 (Race)。
+  当 G 处于休眠状态时，如果有两个 channel 同时有数据到来，Runtime 并不会把它们收集起来再随机挑一个。而是**谁先获取到锁**并成功执行 `CAS(&gp.selectDone, 0, 1)`，谁就是赢家。这是**物理时间上的抢占**（天下武功，唯快不破）。
 
 ---
 
